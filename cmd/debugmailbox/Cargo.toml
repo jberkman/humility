@@ -19,3 +19,8 @@ parse_int = { workspace = true }
 byteorder = { workspace = true }
 zerocopy = { workspace = true }
 probe-rs = { workspace = true }
+packed_struct = "0.10.0"
+packed_struct_codegen = "0.10.0"
+sha2 = { workspace = true }
+rsa = "0.5.0"
+

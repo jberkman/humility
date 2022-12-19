@@ -26,10 +26,14 @@ use clap::Command as ClapCommand;
 use clap::{CommandFactory, Parser};
 use humility::cli::Subcommand;
 use humility_cmd::{Archive, Command};
+use packed_struct::prelude::*;
 use probe_rs::{
     architecture::arm::{ApAddress, ArmProbeInterface, DpAddress},
     Probe,
 };
+use rsa::{pkcs1::FromRsaPrivateKey, PublicKeyParts};
+use sha2::Digest;
+use std::path::PathBuf;
 
 // The debug mailbox registers
 // See 51.5.5.1 of Rev 2.4 of the LPC55 manual
@@ -49,12 +53,70 @@ const ACK_TOKEN: u32 = 0xa5a5;
 pub enum DMCommand {
     //StartDM = 0x1,
     BulkErase = 0x3,
-    //ExitDM = 0x4,
+    ExitDM = 0x4,
     ISPMode = 0x5,
     //FAMode = 0x6,
     StartDebug = 0x7,
-    //DebugChallenge = 0x10,
-    //DebugResponse = 0x11,
+    DebugChallenge = 0x10,
+    DebugResponse = 0x11,
+}
+
+#[derive(PackedStruct, Debug)]
+#[packed_struct(size_bytes = "104", bit_numbering = "msb0", endian = "lsb")]
+pub struct DebugAuthChallenge {
+    version: u32,
+    soc_class: u32,
+    uuid: [u8; 16],
+    revoke: u32,
+    rot_id: [u8; 32],
+    socu_pin: u32,
+    socu_dflt: u32,
+    vendor_usage: u32,
+    cv: [u8; 32],
+}
+
+#[derive(PackedStruct, Debug)]
+#[packed_struct(size_bytes = "940", bit_numbering = "msb0", endian = "lsb")]
+pub struct DebugCred {
+    version: u32,
+    soc_class: u32,
+    uuid: [u8; 16],
+    rot_id: [u8; 128],
+    dck_mod: [u8; 256],
+    dck_exp: [u8; 4],
+    cc_socu: u32,
+    vendor: u32,
+    beacon: u32,
+    rotk_mod: [u8; 256],
+    rotk_exp: [u8; 4],
+    sig: [u8; 256],
+}
+
+impl DebugCred {
+    fn new() -> Self {
+        DebugCred {
+            version: 0,
+            soc_class: 0,
+            uuid: [0; 16],
+            rot_id: [0; 128],
+            dck_mod: [0; 256],
+            dck_exp: [0; 4],
+            cc_socu: 0,
+            vendor: 0,
+            beacon: 0,
+            rotk_mod: [0; 256],
+            rotk_exp: [0; 4],
+            sig: [0; 256],
+        }
+    }
+}
+
+#[derive(PackedStruct, Debug, Copy, Clone)]
+#[packed_struct(size_bytes = "1200", bit_numbering = "msb0", endian = "lsb")]
+pub struct DebugResponse {
+    dc: [u8; 940],
+    ab: [u8; 4],
+    sig: [u8; 256],
 }
 
 #[derive(Parser, Debug)]
@@ -65,6 +127,136 @@ enum DebugMailboxCmd {
     Debug,
     /// Force the device into ISP mode
     Isp,
+    /// Perform debug authentication
+    DebugAuth { debugger_priv: PathBuf, rot_priv: PathBuf },
+}
+
+fn debug_challenge<'a>(
+    probe: &mut Box<dyn ArmProbeInterface + 'a>,
+    addr: &ApAddress,
+) -> Result<DebugAuthChallenge> {
+    // Start debug auth
+    let result = write_req(probe, addr, DMCommand::DebugChallenge, &[])?;
+
+    let transform = unsafe {
+        core::slice::from_raw_parts::<u8>(
+            result.as_ptr() as *const u8,
+            result.len() * 4,
+        )
+    };
+
+    let region = DebugAuthChallenge::unpack(&transform.try_into()?)?;
+
+    println!("Hmmm {:x?}", region);
+    Ok(region)
+}
+
+fn debug_response<'a>(
+    probe: &mut Box<dyn ArmProbeInterface + 'a>,
+    addr: &ApAddress,
+    bytes: &[u8],
+) -> Result<()> {
+    let transform = unsafe {
+        core::slice::from_raw_parts::<u32>(
+            bytes.as_ptr() as *const u32,
+            bytes.len() / 4,
+        )
+    };
+
+    write_req(probe, addr, DMCommand::DebugResponse, &transform)?;
+
+    Ok(())
+}
+
+fn exit_debug_mailbox<'a>(
+    probe: &mut Box<dyn ArmProbeInterface + 'a>,
+    addr: &ApAddress,
+) -> Result<()> {
+    let _ = write_req(probe, addr, DMCommand::ExitDM, &[])?;
+
+    Ok(())
+}
+
+fn debug_auth<'a>(
+    probe: &mut Box<dyn ArmProbeInterface + 'a>,
+    dm_port: &ApAddress,
+    debugger_priv: &PathBuf,
+    rot_priv: &PathBuf,
+) -> Result<()> {
+    let challenge = debug_challenge(probe, dm_port)?;
+
+    let debugger_priv_key =
+        rsa::RsaPrivateKey::read_pkcs1_pem_file(debugger_priv)?;
+    let rot_priv_key = rsa::RsaPrivateKey::read_pkcs1_pem_file(rot_priv)?;
+
+    let mut cred = DebugCred::new();
+
+    cred.version = challenge.version;
+    cred.soc_class = challenge.soc_class;
+
+    let mut key_hash = sha2::Sha256::new();
+
+    // Same method used in generating hashes for images
+    let n = rot_priv_key.n();
+    let e = rot_priv_key.e();
+    key_hash.update(&n.to_bytes_be());
+    key_hash.update(&e.to_bytes_be());
+    cred.rot_id[..32].clone_from_slice(&key_hash.finalize());
+
+    cred.dck_mod.clone_from_slice(&debugger_priv_key.n().to_bytes_be());
+    // This is weird because the exponent is only 3 bytes...
+    for (i, c) in debugger_priv_key.e().to_bytes_be().iter().enumerate() {
+        cred.dck_exp[3 - i] = *c;
+    }
+    cred.cc_socu = 0x3ff;
+
+    cred.rotk_mod.clone_from_slice(&rot_priv_key.n().to_bytes_be());
+    for (i, c) in rot_priv_key.e().to_bytes_be().iter().enumerate() {
+        cred.rotk_exp[3 - i] = *c;
+    }
+
+    let cred_bytes = cred.pack()?;
+
+    let mut hash = sha2::Sha256::new();
+
+    hash.update(&cred_bytes[..0x2ac]);
+
+    let sig = rot_priv_key.sign(
+        rsa::padding::PaddingScheme::PKCS1v15Sign {
+            hash: Some(rsa::hash::Hash::SHA2_256),
+        },
+        hash.finalize().as_slice(),
+    )?;
+
+    cred.sig.clone_from_slice(&sig[..]);
+
+    let signed_bytes = cred.pack()?;
+
+    let mut response =
+        DebugResponse { dc: signed_bytes.clone(), ab: [0; 4], sig: [0; 256] };
+
+    let mut response_hash = sha2::Sha256::new();
+
+    response_hash.update(&response.dc);
+    response_hash.update(&response.ab);
+    response_hash.update(&challenge.cv);
+
+    let saved_hash = response_hash.finalize();
+
+    let response_sig = debugger_priv_key.sign(
+        rsa::padding::PaddingScheme::PKCS1v15Sign {
+            hash: Some(rsa::hash::Hash::SHA2_256),
+        },
+        saved_hash.clone().as_slice(),
+    )?;
+
+    response.sig.clone_from_slice(&response_sig);
+
+    debug_response(probe, dm_port, &response.pack()?)?;
+
+    exit_debug_mailbox(probe, dm_port)?;
+
+    Ok(())
 }
 
 fn alive<'a>(
@@ -267,6 +459,11 @@ fn debugmailboxcmd(context: &mut humility::ExecutionContext) -> Result<()> {
                 write_req(&mut iface, &dm_port, DMCommand::ISPMode, &[0x1])?;
 
             println!("entered ISP mode!");
+        }
+        DebugMailboxCmd::DebugAuth { debugger_priv, rot_priv } => {
+            debug_auth(&mut iface, &dm_port, &debugger_priv, &rot_priv)?;
+
+            println!("Debug auth'd");
         }
     };
 
