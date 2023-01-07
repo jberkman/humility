@@ -417,6 +417,15 @@ fn probecmd(context: &mut humility::ExecutionContext) -> Result<()> {
         let sau_type = SAU_TYPE::read(core)?;
         print("SAU_TYPE", format!("0x{:x}", sau_type.0));
 
+        if sau_type.sregion() > 0 {
+            let sau_ctrl = SAU_CTRL::read(core)?;
+            humility::msg!(
+                "{:>12} => 0x{:8}",
+                "SAU_CTRL",
+                format!("{:x}", sau_ctrl.0)
+            );
+        }
+
         for rnr in 0..sau_type.sregion() {
             let mut sau_rnr = SAU_RNR(0);
             sau_rnr.set_region(rnr);
